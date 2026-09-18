@@ -553,7 +553,7 @@ fn scan_rollouts_with_thread_filter(
             scan.mismatched_rollouts += 1;
             scan.mismatched_session_meta += 1;
             scan.mismatched_thread_ids.insert(header.session_id.clone());
-            scan.scan_failures.push(format!(
+            scan.warnings.push(format!(
                 "Large session file requires a streaming provider rewrite and was left unchanged: {}",
                 path.display()
             ));
