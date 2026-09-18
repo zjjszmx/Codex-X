@@ -21,6 +21,25 @@ pub(crate) struct SessionPreview {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct SessionPageCursor {
+    pub(crate) updated_at_ms: i64,
+    pub(crate) id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionPage {
+    pub(crate) sessions: Vec<SessionPreview>,
+    pub(crate) total: usize,
+    pub(crate) top_level: usize,
+    pub(crate) subagent: usize,
+    pub(crate) has_more: bool,
+    pub(crate) next_cursor: Option<SessionPageCursor>,
+    pub(crate) warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct SessionSyncStatus {
     pub(crate) codex_dir: String,
     pub(crate) target_provider: String,

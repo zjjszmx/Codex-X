@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Codex-X",
+  "productName": "Codex-X Fork",
   "version": "0.3.18",
   "identifier": "com.yynxxxxx.codexx",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Codex-X",
+        "title": "Codex-X Fork",
         "width": 1400,
         "height": 750,
         "minWidth": 1320,
@@ -34,7 +34,7 @@
   },
   "bundle": {
     "active": true,
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -43,16 +43,5 @@
       "icons/icon.ico"
     ],
     "targets": "all"
-  },
-  "plugins": {
-    "updater": {
-      "endpoints": [
-        "https://github.com/yynxxxxx/Codex-X/releases/latest/download/latest.json"
-      ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZCQTBEQkRFNTZCQjBBNUUKUldSZUNydFczdHVnYXkzSTM0N0F4UG5oV3BiVVJ0OEZwazdOd3hMRGRMNGJZaThoOEVneG9qb0cK",
-      "windows": {
-        "installMode": "passive"
-      }
-    }
   }
 }

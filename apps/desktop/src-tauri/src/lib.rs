@@ -35,7 +35,6 @@ mod sqlite_utils;
 mod state;
 mod toml_utils;
 mod transfers;
-mod updates;
 mod usage;
 
 use backups::{
@@ -111,9 +110,9 @@ use sessions::{
     sqlite_session_db_paths,
 };
 use sessions::{
-    delete_codex_sessions_inner, session_sync_status_inner, sqlite_candidate_paths,
-    sync_sessions_provider_inner, SessionDeleteInput, SessionDeleteResult, SessionSyncResult,
-    SessionSyncStatus,
+    delete_codex_sessions_inner, get_session_page as get_session_page_inner,
+    session_sync_status_inner, sqlite_candidate_paths, sync_sessions_provider_inner,
+    SessionDeleteInput, SessionDeleteResult, SessionPage, SessionSyncResult, SessionSyncStatus,
 };
 use skills_mcp::{
     build_skills_mcp_state_inner, check_skill_updates_inner, import_existing_skills_mcp_inner,
@@ -133,7 +132,6 @@ use state::build_state;
 use state::{auth_has_material, build_state_after_migration, ActionResult, CodexState};
 use toml_edit::{value, DocumentMut};
 pub(crate) use toml_utils::string_value;
-use updates::check_app_update;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromptInjectionMode {
@@ -164,7 +162,6 @@ struct AboutInfo {
     codex_dir: String,
     project_url: String,
     github_repo: String,
-    native_updater_supported: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -579,6 +576,30 @@ async fn get_session_sync_status(
 }
 
 #[tauri::command]
+async fn get_session_page(
+    config_dir: Option<String>,
+    cursor_updated_at_ms: Option<i64>,
+    cursor_id: Option<String>,
+    limit: Option<usize>,
+    search: Option<String>,
+    include_internal: Option<bool>,
+) -> Result<SessionPage> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let codex_dir = resolve_codex_dir(config_dir)?;
+        get_session_page_inner(
+            &codex_dir,
+            cursor_updated_at_ms,
+            cursor_id,
+            limit,
+            search,
+            include_internal,
+        )
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("读取会话分页失败: {e}")))?
+}
+
+#[tauri::command]
 async fn sync_sessions_provider(
     config_dir: Option<String>,
     target_provider: Option<String>,
@@ -615,25 +636,12 @@ async fn import_ccswitch_codex_providers(db_path: Option<String>) -> Result<Impo
 
 fn get_about_info_inner(config_dir: Option<String>) -> Result<AboutInfo> {
     let codex_dir = resolve_codex_dir(config_dir)?;
-    #[cfg(target_os = "windows")]
-    let native_updater_supported = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join("Codex-X.portable")))
-        .map(|marker| !marker.is_file())
-        .unwrap_or(true);
-    #[cfg(target_os = "linux")]
-    let native_updater_supported = std::env::var_os("APPIMAGE")
-        .map(std::path::PathBuf::from)
-        .is_some_and(|path| path.is_file());
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    let native_updater_supported = true;
     Ok(AboutInfo {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         codex_version: platform::detect_codex_version(),
         codex_dir: codex_dir.display().to_string(),
-        project_url: "https://github.com/yynxxxxx/Codex-X".to_string(),
-        github_repo: "yynxxxxx/Codex-X".to_string(),
-        native_updater_supported,
+        project_url: "https://github.com/zjjszmx/Codex-X".to_string(),
+        github_repo: "zjjszmx/Codex-X".to_string(),
     })
 }
 
@@ -1625,8 +1633,6 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             desktop_lifecycle::restore_main_window(app);
         }))
-        .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             desktop_lifecycle::setup_system_tray(app)?;
             Ok(())
@@ -1635,7 +1641,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_about_info,
             restart_codex_desktop,
-            check_app_update,
             get_skills_mcp_state,
             preview_existing_skills_mcp,
             import_existing_skills_mcp,
@@ -1652,6 +1657,7 @@ pub fn run() {
             repair_codex_config,
             open_codex_config_file,
             get_session_sync_status,
+            get_session_page,
             sync_sessions_provider,
             delete_codex_sessions,
             read_ccswitch_official_auth,

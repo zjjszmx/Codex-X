@@ -4,6 +4,7 @@ mod catalog;
 mod delete;
 mod export;
 mod global_state;
+mod index;
 mod storage;
 mod sync;
 mod transaction;
@@ -23,8 +24,8 @@ pub(crate) use storage::{
     scan_sqlite, sqlite_session_db_paths,
 };
 pub(crate) use storage::{
-    session_project_title, session_titles_by_id, sqlite_candidate_paths,
+    get_session_page, session_project_title, session_titles_by_id, sqlite_candidate_paths,
     sqlite_candidate_paths_with_timeout, usage_thread_identities, UsageThreadIdentity,
 };
 pub(crate) use sync::{session_sync_status_inner, sync_sessions_provider_inner};
-pub(crate) use types::{SessionSyncResult, SessionSyncStatus};
+pub(crate) use types::{SessionPage, SessionSyncResult, SessionSyncStatus};

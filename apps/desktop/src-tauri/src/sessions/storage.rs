@@ -1,5 +1,8 @@
 use super::global_state::normalize_workspace_path;
-use super::types::{RolloutScan, SessionFileChange, SessionPreview, SqliteScan};
+use super::index::{load_rollout_index, persist_rollout_index, system_time_ns, RolloutIndexEntry};
+use super::types::{
+    RolloutScan, SessionFileChange, SessionPage, SessionPageCursor, SessionPreview, SqliteScan,
+};
 use crate::error::{CodexxError, Result};
 use crate::file_io::{
     atomic_write, io_err, json_err, parse_toml_document, read_to_string_if_exists,
@@ -7,7 +10,10 @@ use crate::file_io::{
 use crate::paths::home_dir;
 use crate::sqlite_utils::{sql_select_column, sqlite_has_table, table_column_set};
 use crate::{config_path, string_value};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{
+    types::{Value as SqlValue, ValueRef},
+    Connection, OpenFlags, Row,
+};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -15,6 +21,97 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use toml_edit::DocumentMut;
+
+const ROLLOUT_FULL_READ_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
+const ROLLOUT_METADATA_PREFIX_LIMIT_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug)]
+struct RolloutHeaderMetadata {
+    session_id: String,
+    title: Option<String>,
+    cwd: Option<String>,
+    model_provider: Option<String>,
+    is_subagent: bool,
+    parent_session_id: Option<String>,
+}
+
+fn rollout_header_metadata(path: &Path) -> Result<RolloutHeaderMetadata> {
+    let file = fs::File::open(path).map_err(|error| io_err(path, error))?;
+    let mut prefix = Vec::new();
+    file.take(ROLLOUT_METADATA_PREFIX_LIMIT_BYTES)
+        .read_to_end(&mut prefix)
+        .map_err(|error| io_err(path, error))?;
+    let complete_len = if prefix.last() == Some(&b'\n') {
+        prefix.len()
+    } else {
+        prefix
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or_default()
+    };
+    for raw_line in prefix[..complete_len].split(|byte| *byte == b'\n') {
+        let raw_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if raw_line.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_slice::<Value>(raw_line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        let Some(payload) = record.get("payload").and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(session_id) = payload
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let title = payload
+            .get("title")
+            .or_else(|| payload.get("first_user_message"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        let cwd = payload
+            .get("cwd")
+            .and_then(Value::as_str)
+            .and_then(normalize_workspace_path);
+        let model_provider = payload
+            .get("model_provider")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        let source = payload.get("source");
+        let is_subagent = source.is_some_and(source_value_is_subagent);
+        let parent_session_id = source
+            .and_then(|value| value.pointer("/subagent/thread_spawn/parent_thread_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        return Ok(RolloutHeaderMetadata {
+            session_id: session_id.to_string(),
+            title,
+            cwd,
+            model_provider,
+            is_subagent,
+            parent_session_id,
+        });
+    }
+    Err(CodexxError::Config(format!(
+        "Large session file has no readable session_meta in its first {} KiB: {}",
+        ROLLOUT_METADATA_PREFIX_LIMIT_BYTES / 1024,
+        path.display()
+    )))
+}
 
 pub(super) fn current_model_provider(codex_dir: &Path, explicit: Option<String>) -> Result<String> {
     if let Some(provider) = explicit
@@ -64,6 +161,7 @@ fn referenced_rollout_paths(
     rollout_paths_by_thread_id: &HashMap<String, String>,
     include_archived_storage: bool,
     failures: &mut Vec<String>,
+    warnings: &mut Vec<String>,
 ) -> HashMap<PathBuf, HashSet<String>> {
     let mut referenced = HashMap::<PathBuf, HashSet<String>>::new();
     for (thread_id, value) in rollout_paths_by_thread_id {
@@ -76,8 +174,8 @@ fn referenced_rollout_paths(
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                failures.push(format!(
-                    "活动 SQLite 引用的会话文件不存在: {}",
+                warnings.push(format!(
+                    "已忽略活动 SQLite 中的旧会话引用（文件不存在）: {}",
                     path.display()
                 ));
                 continue;
@@ -255,6 +353,10 @@ fn scan_rollouts_with_thread_filter(
         );
     }
     paths.sort();
+    let present_index_paths = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<HashSet<_>>();
     scan.discovered_rollout_files = paths.len();
     if let Some(excluded_thread_ids) = excluded_thread_ids {
         paths.retain(|path| {
@@ -276,6 +378,7 @@ fn scan_rollouts_with_thread_filter(
             rollout_paths_by_thread_id,
             include_archived_storage,
             &mut scan.scan_failures,
+            &mut scan.warnings,
         );
         paths.retain(|path| {
             let is_unreferenced_thread_rollout = allowed_thread_ids
@@ -290,11 +393,172 @@ fn scan_rollouts_with_thread_filter(
     }
     scan.rollout_files = paths.len();
 
+    let rollout_index = match load_rollout_index(codex_dir) {
+        Ok(index) => index,
+        Err(error) => {
+            scan.warnings
+                .push(format!("Session metadata cache is unavailable: {error}"));
+            HashMap::new()
+        }
+    };
+    let mut changed_index_entries = Vec::new();
+    let mut metadata_only_files = 0usize;
+
     for path in paths {
         let expected_thread_ids = path
             .canonicalize()
             .ok()
             .and_then(|canonical| referenced.get(&canonical));
+        let path_key = path.display().to_string();
+        let file_metadata = fs::metadata(&path).ok();
+        let file_mtime_ns = file_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .map(system_time_ns)
+            .unwrap_or_default();
+        let file_size = file_metadata
+            .as_ref()
+            .and_then(|metadata| i64::try_from(metadata.len()).ok())
+            .unwrap_or_default();
+        // A cache hit is only safe when the filesystem supplied a complete
+        // fingerprint. Falling back to (0, 0) after a metadata error could
+        // otherwise make a changed rollout look unchanged forever.
+        let has_complete_fingerprint = file_metadata.is_some() && file_mtime_ns > 0;
+        if let Some(cached) = rollout_index.get(&path_key).filter(|cached| {
+            has_complete_fingerprint
+                && cached.file_mtime_ns == file_mtime_ns
+                && cached.file_size == file_size
+        }) {
+            let is_subagent = cached.session_type.as_deref() == Some("subagent");
+            if cached.model_provider.as_deref() == Some(target_provider) {
+                if (exclude_source_marked_subagents && is_subagent)
+                    || excluded_thread_ids
+                        .is_some_and(|excluded| excluded.contains(&cached.session_id))
+                {
+                    continue;
+                }
+                if let Some(expected_thread_ids) = expected_thread_ids {
+                    if expected_thread_ids.len() != 1
+                        || !expected_thread_ids.contains(&cached.session_id)
+                    {
+                        scan.scan_failures.push(format!(
+                            "Cached rollout metadata does not match the referenced thread: {}",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                }
+                if allowed_thread_ids.is_some_and(|allowed| !allowed.contains(&cached.session_id)) {
+                    continue;
+                }
+                scan.session_meta_count += 1;
+                scan.thread_ids.insert(cached.session_id.clone());
+                if let Some(cwd) = cached.cwd.clone() {
+                    scan.cwd_by_thread_id.insert(cached.session_id.clone(), cwd);
+                }
+                continue;
+            }
+        }
+        let is_large_rollout = file_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.len() > ROLLOUT_FULL_READ_LIMIT_BYTES);
+        let header_metadata = rollout_header_metadata(&path);
+        let header_matches_target = header_metadata
+            .as_ref()
+            .is_ok_and(|header| header.model_provider.as_deref() == Some(target_provider));
+        if header_matches_target {
+            let header = header_metadata
+                .as_ref()
+                .expect("matching rollout header must be readable");
+            if (exclude_source_marked_subagents && header.is_subagent)
+                || excluded_thread_ids.is_some_and(|excluded| excluded.contains(&header.session_id))
+            {
+                continue;
+            }
+            if let Some(expected_thread_ids) = expected_thread_ids {
+                if expected_thread_ids.len() != 1
+                    || !expected_thread_ids.contains(&header.session_id)
+                {
+                    scan.scan_failures.push(format!(
+                        "Rollout metadata does not match the referenced thread: {}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            }
+            if allowed_thread_ids.is_some_and(|allowed| !allowed.contains(&header.session_id)) {
+                continue;
+            }
+            scan.session_meta_count += 1;
+            scan.thread_ids.insert(header.session_id.clone());
+            if let Some(cwd) = header.cwd.clone() {
+                scan.cwd_by_thread_id.insert(header.session_id.clone(), cwd);
+            }
+            if has_complete_fingerprint {
+                changed_index_entries.push(RolloutIndexEntry {
+                    jsonl_path: path_key,
+                    file_mtime_ns,
+                    file_size,
+                    session_id: header.session_id.clone(),
+                    title: header.title.clone(),
+                    cwd: header.cwd.clone(),
+                    model_provider: header.model_provider.clone(),
+                    session_type: Some(
+                        if header.is_subagent {
+                            "subagent"
+                        } else {
+                            "main"
+                        }
+                        .to_string(),
+                    ),
+                    parent_session_id: header.parent_session_id.clone(),
+                    updated_at_ms: file_mtime_ns / 1_000_000,
+                });
+            }
+            metadata_only_files += 1;
+            continue;
+        }
+        if is_large_rollout {
+            let header = match header_metadata {
+                Ok(header) => header,
+                Err(error) => {
+                    scan.scan_failures.push(error.to_string());
+                    continue;
+                }
+            };
+            if (exclude_source_marked_subagents && header.is_subagent)
+                || excluded_thread_ids.is_some_and(|excluded| excluded.contains(&header.session_id))
+            {
+                continue;
+            }
+            if let Some(expected_thread_ids) = expected_thread_ids {
+                if expected_thread_ids.len() != 1
+                    || !expected_thread_ids.contains(&header.session_id)
+                {
+                    scan.scan_failures.push(format!(
+                        "Large rollout metadata does not match the referenced thread: {}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            }
+            if allowed_thread_ids.is_some_and(|allowed| !allowed.contains(&header.session_id)) {
+                continue;
+            }
+            scan.session_meta_count += 1;
+            scan.thread_ids.insert(header.session_id.clone());
+            if let Some(cwd) = header.cwd.clone() {
+                scan.cwd_by_thread_id.insert(header.session_id.clone(), cwd);
+            }
+            scan.mismatched_rollouts += 1;
+            scan.mismatched_session_meta += 1;
+            scan.mismatched_thread_ids.insert(header.session_id.clone());
+            scan.scan_failures.push(format!(
+                "Large session file requires a streaming provider rewrite and was left unchanged: {}",
+                path.display()
+            ));
+            continue;
+        }
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) => {
@@ -317,6 +581,9 @@ fn scan_rollouts_with_thread_filter(
         let mut thread_id = None;
         let mut cwd = None;
         let mut is_subagent = false;
+        let mut title = None;
+        let mut observed_provider = None;
+        let mut parent_session_id = None;
 
         for segment in text.split_inclusive('\n') {
             let (line, line_ending) = split_line_ending(segment);
@@ -339,6 +606,34 @@ fn scan_rollouts_with_thread_filter(
                                     .get("cwd")
                                     .and_then(Value::as_str)
                                     .and_then(normalize_workspace_path);
+                            }
+                            if title.is_none() {
+                                title = payload
+                                    .get("title")
+                                    .or_else(|| payload.get("first_user_message"))
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|value| !value.is_empty())
+                                    .map(ToString::to_string);
+                            }
+                            if observed_provider.is_none() {
+                                observed_provider = payload
+                                    .get("model_provider")
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|value| !value.is_empty())
+                                    .map(ToString::to_string);
+                            }
+                            if parent_session_id.is_none() {
+                                parent_session_id = payload
+                                    .get("source")
+                                    .and_then(|source| {
+                                        source.pointer("/subagent/thread_spawn/parent_thread_id")
+                                    })
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|value| !value.is_empty())
+                                    .map(ToString::to_string);
                             }
                             if payload.get("source").is_some_and(source_value_is_subagent) {
                                 is_subagent = true;
@@ -367,13 +662,6 @@ fn scan_rollouts_with_thread_filter(
             next_text.push_str(line_ending);
         }
 
-        if (exclude_source_marked_subagents && is_subagent)
-            || thread_id
-                .as_ref()
-                .is_some_and(|id| excluded_thread_ids.is_some_and(|excluded| excluded.contains(id)))
-        {
-            continue;
-        }
         if invalid_json_lines > 0 {
             scan.scan_failures.push(format!(
                 "会话文件包含 {invalid_json_lines} 行无法解析的 JSON: {}",
@@ -403,6 +691,28 @@ fn scan_rollouts_with_thread_filter(
             ));
             continue;
         };
+        // Do not cache a partially malformed rollout. Re-reading it on later
+        // checks preserves the diagnostics instead of hiding them behind a
+        // seemingly valid fingerprint entry.
+        if invalid_json_lines == 0 && invalid_session_meta == 0 && has_complete_fingerprint {
+            changed_index_entries.push(RolloutIndexEntry {
+                jsonl_path: path_key,
+                file_mtime_ns,
+                file_size,
+                session_id: thread_id.clone(),
+                title,
+                cwd: cwd.clone(),
+                model_provider: observed_provider,
+                session_type: Some(if is_subagent { "subagent" } else { "main" }.to_string()),
+                parent_session_id,
+                updated_at_ms: file_mtime_ns / 1_000_000,
+            });
+        }
+        if (exclude_source_marked_subagents && is_subagent)
+            || excluded_thread_ids.is_some_and(|excluded| excluded.contains(&thread_id))
+        {
+            continue;
+        }
         if let Some(expected_thread_ids) = expected_thread_ids {
             if expected_thread_ids.len() != 1 || !expected_thread_ids.contains(&thread_id) {
                 scan.scan_failures.push(format!(
@@ -433,6 +743,18 @@ fn scan_rollouts_with_thread_filter(
                 next_text,
             });
         }
+    }
+    if metadata_only_files > 0 {
+        scan.warnings.push(format!(
+            "Indexed {metadata_only_files} session file(s) from bounded metadata without loading chat bodies"
+        ));
+    }
+    if let Err(error) =
+        persist_rollout_index(codex_dir, &changed_index_entries, &present_index_paths)
+    {
+        scan.warnings.push(format!(
+            "Session metadata cache could not be updated: {error}"
+        ));
     }
     Ok(scan)
 }
@@ -1587,6 +1909,417 @@ pub(super) fn list_session_previews_with_paths(
     Ok((sessions, warnings))
 }
 
+const SESSION_PAGE_DEFAULT_LIMIT: usize = 100;
+const SESSION_PAGE_MAX_LIMIT: usize = 100;
+
+#[derive(Debug)]
+struct SessionPageRow {
+    preview: SessionPreview,
+    updated_at_ms: i64,
+}
+
+fn session_page_column(columns: &HashSet<String>, name: &str, fallback: &str) -> String {
+    if columns.contains(name) {
+        format!("t.\"{name}\"")
+    } else {
+        fallback.to_string()
+    }
+}
+
+fn session_page_row_text(row: &Row<'_>, index: usize) -> Option<String> {
+    match row.get_ref(index).ok()? {
+        ValueRef::Null => None,
+        ValueRef::Integer(value) => Some(value.to_string()),
+        ValueRef::Real(value) => Some(value.to_string()),
+        ValueRef::Text(value) => String::from_utf8(value.to_vec()).ok(),
+        ValueRef::Blob(_) => None,
+    }
+}
+
+fn session_page_source_is_subagent(expression: &str) -> String {
+    format!(
+        "(LOWER(TRIM(CAST({expression} AS TEXT))) = 'subagent' \
+         OR INSTR(LOWER(CAST({expression} AS TEXT)), '\"subagent\"') > 0)"
+    )
+}
+
+fn session_page_internal_sql(
+    conn: &Connection,
+    columns: &HashSet<String>,
+) -> Result<(String, String)> {
+    let (edge_join, edge_expression) = if sqlite_has_table(conn, "thread_spawn_edges")? {
+        let edge_columns = table_column_set(conn, "thread_spawn_edges")?;
+        if edge_columns.contains("child_thread_id") {
+            (
+                " LEFT JOIN (SELECT DISTINCT \"child_thread_id\" \
+                 FROM \"thread_spawn_edges\") AS session_edges \
+                 ON session_edges.\"child_thread_id\" = t.\"id\""
+                    .to_string(),
+                "session_edges.\"child_thread_id\" IS NOT NULL".to_string(),
+            )
+        } else {
+            (String::new(), "0".to_string())
+        }
+    } else {
+        (String::new(), "0".to_string())
+    };
+    let source_expression = if columns.contains("source") {
+        session_page_source_is_subagent("t.\"source\"")
+    } else {
+        "0".to_string()
+    };
+    let thread_source_expression = if columns.contains("thread_source") {
+        session_page_source_is_subagent("t.\"thread_source\"")
+    } else {
+        "0".to_string()
+    };
+    let source_fallback = if columns.contains("source") {
+        format!(
+            "CASE WHEN NULLIF(TRIM(CAST(t.\"source\" AS TEXT)), '') IS NOT NULL \
+             THEN {source_expression} ELSE {edge_expression} END"
+        )
+    } else {
+        edge_expression
+    };
+    let expression = if columns.contains("thread_source") {
+        format!(
+            "CASE WHEN NULLIF(TRIM(CAST(t.\"thread_source\" AS TEXT)), '') IS NOT NULL \
+             THEN {thread_source_expression} ELSE {source_fallback} END"
+        )
+    } else {
+        source_fallback
+    };
+    Ok((edge_join, expression))
+}
+
+fn session_page_search_pattern(search: &str) -> String {
+    let search = search.to_ascii_lowercase();
+    let mut escaped = String::with_capacity(search.len());
+    for ch in search.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '%' => escaped.push_str("\\%"),
+            '_' => escaped.push_str("\\_"),
+            _ => escaped.push(ch),
+        }
+    }
+    format!("%{escaped}%")
+}
+
+fn session_page_search_clause(
+    columns: &HashSet<String>,
+    search_pattern: Option<&str>,
+) -> (String, Vec<SqlValue>) {
+    let Some(search_pattern) = search_pattern else {
+        return (String::new(), Vec::new());
+    };
+    let fields = [
+        "title",
+        "first_user_message",
+        "preview",
+        "cwd",
+        "model_provider",
+        "model",
+        "id",
+    ];
+    let fields = fields
+        .into_iter()
+        .filter(|field| columns.contains(*field))
+        .map(|field| format!("LOWER(COALESCE(CAST(t.\"{field}\" AS TEXT), '')) LIKE ? ESCAPE '\\'"))
+        .collect::<Vec<_>>();
+    if fields.is_empty() {
+        return (" AND 0".to_string(), Vec::new());
+    }
+    let values = std::iter::repeat_with(|| SqlValue::Text(search_pattern.to_string()))
+        .take(fields.len())
+        .collect();
+    (format!(" AND ({})", fields.join(" OR ")), values)
+}
+
+fn session_page_updated_expression(columns: &HashSet<String>) -> String {
+    let updated_ms = session_page_column(columns, "updated_at_ms", "NULL");
+    let updated = session_page_column(columns, "updated_at", "NULL");
+    format!("CAST(COALESCE({updated_ms}, ({updated}) * 1000, 0) AS INTEGER)")
+}
+
+fn session_page_row_from_sql(
+    row: &Row<'_>,
+    updated_has_column: bool,
+) -> rusqlite::Result<SessionPageRow> {
+    let id = session_page_row_text(row, 0).unwrap_or_default();
+    let title = clean_session_title([
+        session_page_row_text(row, 1),
+        session_page_row_text(row, 2),
+        session_page_row_text(row, 3),
+    ])
+    .unwrap_or_else(|| format!("会话 {}", id.chars().take(8).collect::<String>()));
+    let model_provider = session_page_row_text(row, 4).and_then(|value| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(value)
+    });
+    let model = session_page_row_text(row, 5).and_then(|value| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(value)
+    });
+    let cwd = session_page_row_text(row, 6).and_then(|value| normalize_workspace_path(&value));
+    let rollout_path = session_page_row_text(row, 7).and_then(|value| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(value)
+    });
+    let updated_at_ms = row.get::<_, i64>(8)?;
+    let archived = row.get::<_, i64>(9)? != 0;
+    let has_user_event = row.get::<_, i64>(10)? != 0;
+    let is_subagent = row.get::<_, i64>(11)? != 0;
+    Ok(SessionPageRow {
+        preview: SessionPreview {
+            id,
+            title,
+            model_provider,
+            model,
+            cwd,
+            rollout_path,
+            updated_at_ms: updated_has_column.then_some(updated_at_ms),
+            archived,
+            has_user_event,
+            is_subagent,
+            needs_sync: false,
+        },
+        updated_at_ms,
+    })
+}
+
+fn session_page_cursor_clause(
+    updated_expression: &str,
+    cursor: Option<&SessionPageCursor>,
+) -> (String, Vec<SqlValue>) {
+    let Some(cursor) = cursor else {
+        return (String::new(), Vec::new());
+    };
+    (
+        format!(
+            " AND (({updated_expression}) < ? OR \
+                   (({updated_expression}) = ? AND t.\"id\" > ?))"
+        ),
+        vec![
+            SqlValue::Integer(cursor.updated_at_ms),
+            SqlValue::Integer(cursor.updated_at_ms),
+            SqlValue::Text(cursor.id.clone()),
+        ],
+    )
+}
+
+fn session_page_count_rows(
+    conn: &Connection,
+    columns: &HashSet<String>,
+    internal_join: &str,
+    internal_expression: &str,
+    search_pattern: Option<&str>,
+) -> Result<(usize, usize)> {
+    let (search_clause, search_values) = session_page_search_clause(columns, search_pattern);
+    let sql = format!(
+        "SELECT COALESCE(SUM(CASE WHEN ({internal_expression}) THEN 0 ELSE 1 END), 0), \
+                COALESCE(SUM(CASE WHEN ({internal_expression}) THEN 1 ELSE 0 END), 0) \
+         FROM threads AS t{internal_join} WHERE 1 = 1{search_clause}"
+    );
+    conn.query_row(&sql, rusqlite::params_from_iter(search_values), |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    })
+    .map(|(top_level, subagent)| (top_level.max(0) as usize, subagent.max(0) as usize))
+    .map_err(|error| CodexxError::Database(error.to_string()))
+}
+
+/// Return one bounded, cursor-addressable page directly from the SQLite thread metadata.
+/// This path intentionally never opens or scans rollout JSONL files.
+pub(crate) fn get_session_page(
+    codex_dir: &Path,
+    cursor_updated_at_ms: Option<i64>,
+    cursor_id: Option<String>,
+    limit: Option<usize>,
+    search: Option<String>,
+    include_internal: Option<bool>,
+) -> Result<SessionPage> {
+    let limit = limit
+        .unwrap_or(SESSION_PAGE_DEFAULT_LIMIT)
+        .clamp(1, SESSION_PAGE_MAX_LIMIT);
+    let cursor = cursor_id
+        .filter(|value| !value.trim().is_empty())
+        .map(|id| SessionPageCursor {
+            updated_at_ms: cursor_updated_at_ms.unwrap_or_default(),
+            id,
+        });
+    let include_internal = include_internal.unwrap_or(false);
+    let search_pattern = search
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| session_page_search_pattern(&value));
+
+    let discovery = discover_sqlite_databases(codex_dir);
+    let paths = if discovery.active_paths.is_empty() {
+        discovery.active_first_session_paths()
+    } else {
+        discovery.active_paths.clone()
+    };
+    let mut warnings = discovery.active_scan_failures.clone();
+    warnings.extend(
+        discovery
+            .unreadable_paths
+            .iter()
+            .map(|path| format!("无法读取会话数据库: {}", path.display())),
+    );
+    let mut top_level = 0usize;
+    let mut subagent = 0usize;
+    let mut page_rows = Vec::<SessionPageRow>::new();
+    let mut database_has_more = false;
+    let fetch_limit = (limit + 1).saturating_add(1);
+
+    for path in paths {
+        let conn = match Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(conn) => conn,
+            Err(error) => {
+                warnings.push(format!("无法读取会话数据库: {} ({error})", path.display()));
+                continue;
+            }
+        };
+        if !sqlite_has_table(&conn, "threads")? {
+            continue;
+        }
+        let columns = table_column_set(&conn, "threads")?;
+        if !columns.contains("id") {
+            warnings.push(format!("会话数据库缺少 threads.id: {}", path.display()));
+            continue;
+        }
+        let (internal_join, internal_expression) = session_page_internal_sql(&conn, &columns)?;
+        match session_page_count_rows(
+            &conn,
+            &columns,
+            &internal_join,
+            &internal_expression,
+            search_pattern.as_deref(),
+        ) {
+            Ok((database_top_level, database_subagent)) => {
+                top_level = top_level.saturating_add(database_top_level);
+                subagent = subagent.saturating_add(database_subagent);
+            }
+            Err(error) => {
+                warnings.push(format!("无法统计会话数据库: {} ({error})", path.display()))
+            }
+        }
+
+        let updated_expression = session_page_updated_expression(&columns);
+        let id_expression = session_page_column(&columns, "id", "NULL");
+        let title_expression = session_page_column(&columns, "title", "NULL");
+        let first_message_expression = session_page_column(&columns, "first_user_message", "NULL");
+        let preview_expression = session_page_column(&columns, "preview", "NULL");
+        let provider_expression = session_page_column(&columns, "model_provider", "NULL");
+        let model_expression = session_page_column(&columns, "model", "NULL");
+        let cwd_expression = session_page_column(&columns, "cwd", "NULL");
+        let rollout_expression = session_page_column(&columns, "rollout_path", "NULL");
+        let archived_expression = session_page_column(&columns, "archived", "0");
+        let has_user_event_expression = session_page_column(&columns, "has_user_event", "0");
+        let (search_clause, search_values) =
+            session_page_search_clause(&columns, search_pattern.as_deref());
+        let (cursor_clause, cursor_values) =
+            session_page_cursor_clause(&updated_expression, cursor.as_ref());
+        let internal_clause = if include_internal {
+            String::new()
+        } else {
+            format!(" AND NOT ({internal_expression})")
+        };
+        let sql = format!(
+            "SELECT {id_expression}, {title_expression}, {first_message_expression}, \
+                    {preview_expression}, {provider_expression}, {model_expression}, \
+                    {cwd_expression}, {rollout_expression}, {updated_expression} AS \
+                    __codexx_updated_at_ms, CAST(COALESCE({archived_expression}, 0) AS INTEGER), \
+                    CAST(COALESCE({has_user_event_expression}, 0) AS INTEGER), \
+                    CAST(({internal_expression}) AS INTEGER) \
+             FROM threads AS t{internal_join} \
+             WHERE 1 = 1{search_clause}{cursor_clause}{internal_clause} \
+             ORDER BY __codexx_updated_at_ms DESC, t.\"id\" ASC LIMIT ?"
+        );
+        let mut params = Vec::<SqlValue>::new();
+        params.extend(search_values);
+        params.extend(cursor_values);
+        params.push(SqlValue::Integer(fetch_limit as i64));
+        let mut statement = match conn.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                warnings.push(format!("无法查询会话数据库: {} ({error})", path.display()));
+                continue;
+            }
+        };
+        let rows = match statement.query_map(rusqlite::params_from_iter(params), |row| {
+            session_page_row_from_sql(
+                row,
+                columns.contains("updated_at_ms") || columns.contains("updated_at"),
+            )
+        }) {
+            Ok(rows) => rows,
+            Err(error) => {
+                warnings.push(format!("无法读取会话分页: {} ({error})", path.display()));
+                continue;
+            }
+        };
+        let mut database_rows = Vec::new();
+        for row in rows {
+            match row {
+                Ok(row) => database_rows.push(row),
+                Err(error) => {
+                    warnings.push(format!("无法解析会话分页行: {} ({error})", path.display()))
+                }
+            }
+        }
+        if database_rows.len() > limit + 1 {
+            database_has_more = true;
+            database_rows.truncate(limit + 1);
+        }
+        page_rows.extend(database_rows);
+    }
+
+    page_rows.sort_by(|left, right| {
+        right
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| left.preview.id.cmp(&right.preview.id))
+    });
+    let mut seen = HashSet::new();
+    let mut sessions = page_rows
+        .into_iter()
+        .filter(|row| seen.insert(row.preview.id.clone()))
+        .map(|row| row.preview)
+        .take(limit + 1)
+        .collect::<Vec<_>>();
+    let page_has_extra = sessions.len() > limit;
+    if page_has_extra {
+        sessions.truncate(limit);
+    }
+    let total = if include_internal {
+        top_level + subagent
+    } else {
+        top_level
+    };
+    let has_more = page_has_extra || database_has_more;
+    let next_cursor =
+        has_more
+            .then(|| sessions.last())
+            .flatten()
+            .map(|session| SessionPageCursor {
+                updated_at_ms: session.updated_at_ms.unwrap_or_default(),
+                id: session.id.clone(),
+            });
+    Ok(SessionPage {
+        sessions,
+        total,
+        top_level,
+        subagent,
+        has_more,
+        next_cursor,
+        warnings,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1604,6 +2337,27 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create test codex dir");
         path
+    }
+
+    #[test]
+    fn missing_sqlite_rollout_reference_is_a_non_blocking_warning() {
+        let codex_dir = temp_codex_dir("missing-rollout-reference");
+        fs::create_dir_all(codex_dir.join("sessions")).unwrap();
+        let thread_id = "019dd389-96fc-70b1-ba6c-388ca8a96665";
+        let thread_ids = HashSet::from([thread_id.to_string()]);
+        let missing_path = codex_dir
+            .join("sessions/2026/04/28")
+            .join(format!("rollout-2026-04-28T17-59-31-{thread_id}.jsonl"));
+        let rollout_paths =
+            HashMap::from([(thread_id.to_string(), missing_path.display().to_string())]);
+
+        let scan = scan_rollouts_for_thread_ids(&codex_dir, "openai", &thread_ids, &rollout_paths)
+            .unwrap();
+
+        assert!(scan.scan_failures.is_empty());
+        assert_eq!(scan.warnings.len(), 1);
+        assert!(scan.warnings[0].contains("旧会话引用"));
+        fs::remove_dir_all(codex_dir).unwrap();
     }
 
     fn create_thread_database(path: &Path, id: &str, provider: &str) {
@@ -1633,6 +2387,97 @@ mod tests {
         let conn = Connection::open(path).unwrap();
         conn.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, title, first_user_message, preview, cwd TEXT);").unwrap();
         conn
+    }
+
+    fn create_page_database(path: &Path, count: usize) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                first_user_message TEXT,
+                preview TEXT,
+                model_provider TEXT,
+                model TEXT,
+                cwd TEXT,
+                rollout_path TEXT,
+                updated_at_ms INTEGER,
+                archived INTEGER NOT NULL DEFAULT 0,
+                has_user_event INTEGER NOT NULL DEFAULT 1,
+                source TEXT,
+                thread_source TEXT
+             );
+             CREATE TABLE thread_spawn_edges (
+                parent_thread_id TEXT,
+                child_thread_id TEXT
+             );",
+        )
+        .unwrap();
+        let transaction = conn.transaction().unwrap();
+        for index in 0..count {
+            let id = format!("thread-{index:05}");
+            let source = (index % 10 == 0).then_some("subagent");
+            transaction
+                .execute(
+                    "INSERT INTO threads
+                     (id, title, first_user_message, preview, model_provider, model, cwd,
+                      updated_at_ms, source)
+                     VALUES (?1, ?2, ?3, ?4, 'openai', 'gpt-test', '/workspace/project', ?5, ?6)",
+                    (
+                        &id,
+                        format!("Session {index}"),
+                        format!("Message {index}"),
+                        if index % 25 == 0 {
+                            "needle preview"
+                        } else {
+                            "ordinary preview"
+                        },
+                        (count - index) as i64,
+                        source,
+                    ),
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    fn bounded_rollout_header_reads_metadata_without_chat_body() {
+        let codex_dir = temp_codex_dir("bounded-rollout-header");
+        let path = codex_dir.join("rollout.jsonl");
+        let session_meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": "session-large",
+                "title": "Large session",
+                "cwd": "C:/workspace/project",
+                "model_provider": "openai",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": { "parent_thread_id": "session-parent" }
+                    }
+                }
+            }
+        });
+        fs::write(
+            &path,
+            format!("{session_meta}\n{{\"type\":\"event_msg\",\"payload\":{{}}}}\n"),
+        )
+        .expect("write rollout fixture");
+
+        let metadata = rollout_header_metadata(&path).expect("read bounded rollout metadata");
+        assert_eq!(metadata.session_id, "session-large");
+        assert_eq!(metadata.title.as_deref(), Some("Large session"));
+        assert_eq!(metadata.cwd.as_deref(), Some("C:/workspace/project"));
+        assert_eq!(metadata.model_provider.as_deref(), Some("openai"));
+        assert!(metadata.is_subagent);
+        assert_eq!(
+            metadata.parent_session_id.as_deref(),
+            Some("session-parent")
+        );
+
+        let _ = fs::remove_dir_all(codex_dir);
     }
 
     fn create_identity_database(path: &Path) -> Connection {
@@ -2224,6 +3069,107 @@ mod tests {
         .0;
         assert_eq!(previews.len(), 1);
         assert_eq!(previews[0].title, "active title");
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn session_page_limits_pages_and_advances_without_duplicates() {
+        for count in [100usize, 1_000, 5_000] {
+            let codex_dir = temp_codex_dir(&format!("session-page-{count}"));
+            let database = codex_dir.join("state_10.sqlite");
+            create_page_database(&database, count);
+
+            let first = get_session_page(&codex_dir, None, None, None, None, Some(true))
+                .expect("read first session page");
+            assert_eq!(first.sessions.len(), count.min(100));
+            assert_eq!(first.total, count);
+            assert_eq!(first.top_level, count - count.div_ceil(10));
+            assert_eq!(first.subagent, count.div_ceil(10));
+
+            let mut ids = HashSet::new();
+            ids.extend(first.sessions.iter().map(|session| session.id.clone()));
+            let mut page = first;
+            while page.has_more {
+                let cursor = page.next_cursor.clone().expect("next page cursor");
+                page = get_session_page(
+                    &codex_dir,
+                    Some(cursor.updated_at_ms),
+                    Some(cursor.id),
+                    Some(100),
+                    None,
+                    Some(true),
+                )
+                .expect("read next session page");
+                assert!(page.sessions.len() <= 100);
+                for session in &page.sessions {
+                    assert!(ids.insert(session.id.clone()), "duplicate {}", session.id);
+                }
+            }
+            assert_eq!(ids.len(), count);
+            assert!(!ids.is_empty());
+            let _ = fs::remove_dir_all(codex_dir);
+        }
+    }
+
+    #[test]
+    fn session_page_search_uses_metadata_fields() {
+        let codex_dir = temp_codex_dir("session-page-search");
+        let database = codex_dir.join("state_10.sqlite");
+        create_page_database(&database, 100);
+
+        let page = get_session_page(
+            &codex_dir,
+            None,
+            None,
+            Some(100),
+            Some("needle".to_string()),
+            Some(true),
+        )
+        .expect("search session metadata");
+        assert_eq!(page.total, 4);
+        assert_eq!(page.sessions.len(), 4);
+        assert!(page.sessions.iter().all(|session| {
+            [
+                "thread-00000",
+                "thread-00025",
+                "thread-00050",
+                "thread-00075",
+            ]
+            .contains(&session.id.as_str())
+        }));
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn session_page_excludes_internal_threads_before_limit() {
+        let codex_dir = temp_codex_dir("session-page-internal");
+        let database = codex_dir.join("state_10.sqlite");
+        create_page_database(&database, 250);
+        let conn = Connection::open(&database).expect("open page database for edge fixture");
+        conn.execute(
+            "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id)
+             VALUES ('thread-parent', 'thread-00001')",
+            [],
+        )
+        .expect("insert edge-only subagent");
+        drop(conn);
+
+        let top_level = get_session_page(&codex_dir, None, None, Some(100), None, None)
+            .expect("read top-level sessions");
+        assert_eq!(top_level.sessions.len(), 100);
+        assert!(top_level
+            .sessions
+            .iter()
+            .all(|session| !session.is_subagent));
+        assert_eq!(top_level.subagent, 26);
+
+        let all = get_session_page(&codex_dir, None, None, Some(100), None, Some(true))
+            .expect("read all sessions");
+        assert_eq!(all.sessions.len(), 100);
+        assert!(all.sessions.iter().any(|session| session.is_subagent));
+        assert_eq!(all.total, 250);
 
         let _ = fs::remove_dir_all(codex_dir);
     }

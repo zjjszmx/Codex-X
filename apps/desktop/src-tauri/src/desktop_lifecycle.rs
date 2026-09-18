@@ -57,19 +57,30 @@ fn show_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
 
 pub(crate) fn restore_main_window(app: &tauri::AppHandle) {
     if let Err(error) = show_main_window(app) {
-        eprintln!("failed to restore the Codex-X window: {error}");
+        eprintln!("failed to restore the Codex-X Fork window: {error}");
     }
 }
 
 pub(crate) fn setup_system_tray(app: &tauri::App) -> tauri::Result<()> {
-    let show_window =
-        MenuItem::with_id(app, SHOW_WINDOW_MENU_ID, "显示 Codex-X", true, None::<&str>)?;
-    let quit_app = MenuItem::with_id(app, QUIT_APP_MENU_ID, "退出 Codex-X", true, None::<&str>)?;
+    let show_window = MenuItem::with_id(
+        app,
+        SHOW_WINDOW_MENU_ID,
+        "显示 Codex-X Fork",
+        true,
+        None::<&str>,
+    )?;
+    let quit_app = MenuItem::with_id(
+        app,
+        QUIT_APP_MENU_ID,
+        "退出 Codex-X Fork",
+        true,
+        None::<&str>,
+    )?;
     let menu = Menu::with_items(app, &[&show_window, &quit_app])?;
 
     let mut tray = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
-        .tooltip("Codex-X")
+        .tooltip("Codex-X Fork")
         .show_menu_on_left_click(SHOW_TRAY_MENU_ON_LEFT_CLICK)
         .on_menu_event(|app, event| match event.id().as_ref() {
             SHOW_WINDOW_MENU_ID => restore_main_window(app),

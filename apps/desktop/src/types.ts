@@ -163,26 +163,11 @@ export type AboutInfo = {
   codexDir: string;
   projectUrl: string;
   githubRepo: string;
-  nativeUpdaterSupported: boolean;
 };
 
 export type CodexDesktopRestartResult = {
   appName: string;
   wasRunning: boolean;
-};
-
-export type ReleaseInfo = {
-  status: "idle" | "checking" | "ok" | "error";
-  latestVersion?: string;
-  htmlUrl?: string;
-  hasUpdate?: boolean;
-  updateMethod?: "native" | "download";
-};
-
-export type AppUpdateInfo = {
-  latestVersion: string;
-  htmlUrl: string;
-  hasUpdate: boolean;
 };
 
 export type ProviderConnectionResult = {

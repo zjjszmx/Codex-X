@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-const APP_DB_SCHEMA_VERSION: i64 = 5;
+const APP_DB_SCHEMA_VERSION: i64 = 6;
 
 struct DatabaseInitializer {
     migration_lock: Mutex<()>,
@@ -220,7 +220,26 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
             codex_dir TEXT PRIMARY KEY,
             profile_id TEXT NOT NULL,
             updated_at TEXT NOT NULL
-        );",
+        );
+        CREATE TABLE IF NOT EXISTS session_rollout_index (
+            codex_dir TEXT NOT NULL,
+            jsonl_path TEXT NOT NULL,
+            file_mtime_ns INTEGER NOT NULL,
+            file_size INTEGER NOT NULL,
+            session_id TEXT NOT NULL,
+            title TEXT,
+            cwd TEXT,
+            model_provider TEXT,
+            session_type TEXT,
+            parent_session_id TEXT,
+            updated_at_ms INTEGER NOT NULL,
+            last_indexed_at INTEGER NOT NULL,
+            PRIMARY KEY(codex_dir, jsonl_path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_rollout_index_updated_at
+            ON session_rollout_index(codex_dir, updated_at_ms DESC, session_id);
+        CREATE INDEX IF NOT EXISTS idx_session_rollout_index_session_type
+            ON session_rollout_index(codex_dir, session_type);",
     )
     .map_err(|e| CodexxError::Database(e.to_string()))?;
     ensure_sqlite_column(
@@ -392,7 +411,7 @@ mod tests {
             PRAGMA user_version = 4;").unwrap();
         drop(legacy);
         let migrated = DatabaseInitializer::new().open_at(&path).unwrap();
-        assert_eq!(schema_version(&migrated).unwrap(), 5);
+        assert_eq!(schema_version(&migrated).unwrap(), APP_DB_SCHEMA_VERSION);
         let stored = crate::providers::list_saved_providers_on_connection(&migrated).unwrap();
         assert_eq!(stored.len(), 1);
         assert!(stored[0].model_mappings.is_empty());
@@ -413,6 +432,133 @@ mod tests {
             )
         );
         drop(migrated);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn version_five_database_migrates_rollout_index_cache_idempotently() {
+        let path = test_db_path("session-rollout-index-v6");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create legacy database directory");
+        }
+        let legacy = Connection::open(&path).expect("create version five database");
+        legacy
+            .execute_batch(
+                "CREATE TABLE prompts (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO prompts (id, title, filename, content, created_at, updated_at)
+                VALUES ('legacy-prompt', 'Legacy prompt', 'legacy.md', 'legacy content', '1', '2');
+                PRAGMA user_version = 5;",
+            )
+            .expect("seed version five database");
+        drop(legacy);
+
+        let initializer = DatabaseInitializer::new();
+        let migrated = initializer
+            .open_at(&path)
+            .expect("migrate version five database");
+        assert_eq!(
+            schema_version(&migrated).expect("read migrated schema version"),
+            APP_DB_SCHEMA_VERSION
+        );
+
+        let columns = migrated
+            .prepare("PRAGMA table_info(session_rollout_index)")
+            .expect("prepare rollout index schema query")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("read rollout index columns")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect rollout index columns");
+        assert_eq!(
+            columns,
+            vec![
+                "codex_dir",
+                "jsonl_path",
+                "file_mtime_ns",
+                "file_size",
+                "session_id",
+                "title",
+                "cwd",
+                "model_provider",
+                "session_type",
+                "parent_session_id",
+                "updated_at_ms",
+                "last_indexed_at",
+            ]
+        );
+
+        let indexes = migrated
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'session_rollout_index'",
+            )
+            .expect("prepare rollout index indexes query")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("read rollout index indexes")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect rollout index indexes");
+        assert!(indexes
+            .iter()
+            .any(|name| name == "idx_session_rollout_index_updated_at"));
+        assert!(indexes
+            .iter()
+            .any(|name| name == "idx_session_rollout_index_session_type"));
+
+        let legacy_title: String = migrated
+            .query_row(
+                "SELECT title FROM prompts WHERE id = 'legacy-prompt'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read preserved legacy prompt");
+        assert_eq!(legacy_title, "Legacy prompt");
+        migrated
+            .execute(
+                "INSERT INTO session_rollout_index (
+                    codex_dir, jsonl_path, file_mtime_ns, file_size, session_id,
+                    title, cwd, model_provider, session_type, parent_session_id,
+                    updated_at_ms, last_indexed_at
+                ) VALUES (
+                    '/tmp/legacy-codex', '/tmp/legacy-codex/rollout.jsonl',
+                    123, 456, 'session-1', 'Session 1', '/tmp/project',
+                    'openai', 'main', NULL, 789, 790
+                )",
+                [],
+            )
+            .expect("write rollout index row after migration");
+        drop(migrated);
+
+        let reopened = initializer
+            .open_at(&path)
+            .expect("reopen migrated version five database");
+        assert_eq!(
+            schema_version(&reopened).expect("read reopened schema version"),
+            APP_DB_SCHEMA_VERSION
+        );
+        let cached_count: i64 = reopened
+            .query_row(
+                "SELECT COUNT(*) FROM session_rollout_index
+                 WHERE codex_dir = '/tmp/legacy-codex'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rollout index rows after reopen");
+        assert_eq!(cached_count, 1);
+        let preserved_count: i64 = reopened
+            .query_row(
+                "SELECT COUNT(*) FROM prompts WHERE id = 'legacy-prompt'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count preserved legacy prompts after reopen");
+        assert_eq!(preserved_count, 1);
+        drop(reopened);
         remove_test_db(&path);
     }
 

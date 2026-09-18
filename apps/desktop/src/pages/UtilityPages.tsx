@@ -3,12 +3,10 @@ import type { ReactNode } from "react";
 import {
   CheckCircle2,
   BarChart3,
-  Download,
   ExternalLink,
   Globe2,
   Loader2,
   Power,
-  RefreshCw,
   Sparkles,
   SlidersHorizontal,
 } from "lucide-react";
@@ -315,20 +313,6 @@ export type AboutCopy = {
   projectLabel: ReactNode;
   openProjectLabel: ReactNode;
   openIssuesLabel: ReactNode;
-  releasesEyebrow: ReactNode;
-  releasesTitle: ReactNode;
-  releaseStatusLabel: ReactNode;
-  latestVersionLabel: ReactNode;
-  checkUpdateLabel: ReactNode;
-  openReleasesLabel: ReactNode;
-};
-
-export type AboutReleaseState = {
-  status: ReactNode;
-  latestVersion: ReactNode;
-  tone?: UtilityStatusTone;
-  checking?: boolean;
-  canOpenReleases?: boolean;
 };
 
 export type AboutPageProps = {
@@ -337,11 +321,8 @@ export type AboutPageProps = {
   codexVersion: ReactNode;
   codexHome: ReactNode;
   projectUrl: ReactNode;
-  release: AboutReleaseState;
   onOpenProject: () => void;
   onOpenIssues: () => void;
-  onCheckUpdate: () => void;
-  onOpenReleases: () => void;
 };
 
 type InfoRowProps = {
@@ -365,15 +346,9 @@ export function AboutPage({
   codexVersion,
   codexHome,
   projectUrl,
-  release,
   onOpenProject,
   onOpenIssues,
-  onCheckUpdate,
-  onOpenReleases,
 }: AboutPageProps) {
-  const releaseTone = release.tone || "neutral";
-  const releaseStatusClass = `cx-page-release-status cx-page-release-status--${releaseTone}`;
-
   return (
     <section className="cx-utility cx-page cx-page--about">
       <PageHeader eyebrow={copy.eyebrow} title={copy.title} />
@@ -397,39 +372,6 @@ export function AboutPage({
         </div>
       </section>
 
-      <section className="cx-page-panel cx-page-release-panel">
-        <div className="cx-page-release-header">
-          <div>
-            <div className="cx-page-eyebrow cx-page-eyebrow--muted">{copy.releasesEyebrow}</div>
-            <h3>{copy.releasesTitle}</h3>
-          </div>
-          <span className={releaseStatusClass} aria-live="polite">{release.status}</span>
-        </div>
-        <div className="cx-page-info-list">
-          <InfoRow label={copy.releaseStatusLabel} value={release.status} />
-          <InfoRow label={copy.latestVersionLabel} value={release.latestVersion} />
-        </div>
-        <div className="cx-page-panel-actions">
-          <button
-            type="button"
-            className="cx-page-button cx-page-button--primary"
-            onClick={onCheckUpdate}
-            disabled={release.checking}
-          >
-            {release.checking ? <Loader2 size={15} className="cx-page-spin" aria-hidden="true" /> : <RefreshCw size={15} aria-hidden="true" />}
-            {copy.checkUpdateLabel}
-          </button>
-          <button
-            type="button"
-            className="cx-page-button cx-page-button--secondary"
-            onClick={onOpenReleases}
-            disabled={release.canOpenReleases === false}
-          >
-            <Download size={15} aria-hidden="true" />
-            {copy.openReleasesLabel}
-          </button>
-        </div>
-      </section>
     </section>
   );
 }

@@ -17,11 +17,9 @@ import { AppShell, type AppTab, type AppTheme } from "./components/AppShell";
 import {
   AppToast,
   StartupWizardDialog,
-  UpdateDialog,
 } from "./components/AppDialogs";
 import { PageTransition } from "./components/PageTransition";
 import { cx } from "./components/ui";
-import { appUpdater, useAppUpdater } from "./appUpdater";
 import { providerProfilesMatch, type ProviderProfile } from "./providerProfiles";
 import { orderProviderRows } from "./providerRowOrder";
 import { createPresetProvider, getProviderPreset, getProviderPresetVariant } from "./providerPresets";
@@ -33,7 +31,6 @@ import { ConfigHealthToast } from "./components/ConfigHealthToast";
 import type {
   AboutInfo,
   ActionResult,
-  AppUpdateInfo,
   BuiltinPromptDetail,
   BuiltinPromptStatus,
   CodexDesktopRestartResult,
@@ -52,7 +49,6 @@ import type {
   ProviderModel,
   ProviderModelsResult,
   ProviderMode,
-  ReleaseInfo,
   SavedPrompt,
   SavedProvider,
   SessionDeleteResult,
@@ -70,12 +66,28 @@ import "./styles/dark-theme.css";
 
 type Tab = AppTab;
 
+type SessionPageCursor = {
+  updatedAtMs: number;
+  id: string;
+};
+
+type SessionPage = {
+  sessions: SessionPreview[];
+  total: number;
+  topLevel: number;
+  subagent: number;
+  hasMore: boolean;
+  nextCursor?: SessionPageCursor | null;
+  warnings: string[];
+};
+
 const LANG_KEY = "codexx.lang";
 const THEME_KEY = "codexx.theme";
 const STARTUP_WIZARD_SEEN_KEY = "codexx.startupWizardSeen";
 const ACTIVE_PROVIDER_KEY = "codexx.activeProviderId";
 const PROMPT_INJECTION_MODE_KEY = "codexx.promptInjectionMode";
-const FALLBACK_GITHUB_REPO = "yynxxxxx/Codex-X";
+const SESSION_GROUP_BY_CWD_KEY = "codexx.sessionGroupByCwd";
+const FALLBACK_GITHUB_REPO = "zjjszmx/Codex-X";
 const DEFAULT_OFFICIAL_PROFILE_ID = "openai-official";
 
 type ThemeTransitionDocument = Document & {
@@ -739,7 +751,6 @@ function App() {
     localStorage.getItem(THEME_KEY) === "dark" ? "dark" : "light",
   );
   const t = dict[lang];
-  const updater = useAppUpdater();
   const isMacRuntime = navigator.userAgent.toLowerCase().includes("mac");
   const [tab, setTab] = React.useState<Tab>("dashboard");
   const [visitedTabs, setVisitedTabs] = React.useState<Set<Tab>>(() => new Set(["dashboard"]));
@@ -765,9 +776,14 @@ function App() {
   const [builtinPromptStatus, setBuiltinPromptStatus] = React.useState<BuiltinPromptStatus[]>([]);
   const [aboutInfo, setAboutInfo] = React.useState<AboutInfo | null>(null);
   const [aboutLoading, setAboutLoading] = React.useState(false);
-  const [releaseInfo, setReleaseInfo] = React.useState<ReleaseInfo>({ status: "idle" });
-  const [updatePromptOpen, setUpdatePromptOpen] = React.useState(false);
   const [sessionStatus, setSessionStatus] = React.useState<SessionSyncStatus | null>(null);
+  const [sessionItems, setSessionItems] = React.useState<SessionPreview[]>([]);
+  const [sessionPageCursor, setSessionPageCursor] = React.useState<SessionPageCursor | null>(null);
+  const [sessionPageTotal, setSessionPageTotal] = React.useState(0);
+  const [sessionTopLevelTotal, setSessionTopLevelTotal] = React.useState(0);
+  const [sessionSubagentTotal, setSessionSubagentTotal] = React.useState(0);
+  const [sessionHasMore, setSessionHasMore] = React.useState(false);
+  const [sessionPageLoading, setSessionPageLoading] = React.useState(false);
   const [skillsMcpState, setSkillsMcpState] = React.useState<SkillsMcpState | null>(null);
   const [skillsMcpImportPreview, setSkillsMcpImportPreview] = React.useState<SkillsMcpImportPreview | null>(null);
   const [skillsMcpImportOpen, setSkillsMcpImportOpen] = React.useState(false);
@@ -779,7 +795,9 @@ function App() {
   const [startupClosing, setStartupClosing] = React.useState(false);
   const [sessionQuery, setSessionQuery] = React.useState("");
   const deferredSessionQuery = React.useDeferredValue(sessionQuery);
-  const [sessionGroupByCwd, setSessionGroupByCwd] = React.useState(false);
+  const [sessionGroupByCwd, setSessionGroupByCwd] = React.useState(
+    () => localStorage.getItem(SESSION_GROUP_BY_CWD_KEY) !== "false",
+  );
   const [showInternalSessions, setShowInternalSessions] = React.useState(false);
   const [selectedSessionIds, setSelectedSessionIds] = React.useState<string[]>([]);
   const [sessionDeleteConfirmOpen, setSessionDeleteConfirmOpen] = React.useState(false);
@@ -816,7 +834,6 @@ function App() {
     configText: buildOfficialTomlPreview("gpt-5.5"),
   });
   const [promptModeHelpOpen, setPromptModeHelpOpen] = React.useState(false);
-  const autoUpdateCheckedRef = React.useRef(false);
   const promptImportRef = React.useRef<HTMLInputElement | null>(null);
   const nativeTransferBusyRef = React.useRef(false);
   const [sessionExportBusy, setSessionExportBusy] = React.useState(false);
@@ -845,6 +862,8 @@ function App() {
   const aboutLoadKeyRef = React.useRef("");
   const sessionAutoLoadKeyRef = React.useRef("");
   const sessionLoadRequestRef = React.useRef(0);
+  const sessionPageRequestRef = React.useRef(0);
+  const sessionPageLoadingRef = React.useRef(false);
   const promptRefreshInFlightRef = React.useRef<Promise<BuiltinPromptStatus[]> | null>(null);
   const promptAutoRefreshAttemptedRef = React.useRef(false);
   const promptCatalogReadyRef = React.useRef(false);
@@ -925,17 +944,6 @@ function App() {
     setSavedProviders(providers);
   }, []);
   const currentInstructionId = instructionIdFromPath(state?.instructionFile, instructionTemplates);
-  const releaseStatusLabel = React.useMemo(() => {
-    if (updater.state.phase === "downloading") return lang === "zh" ? "下载中" : "Downloading";
-    if (updater.state.phase === "installing") return lang === "zh" ? "安装中" : "Installing";
-    if (updater.state.phase === "ready") return lang === "zh" ? "等待重启" : "Restart required";
-    if (releaseInfo.status === "checking") return lang === "zh" ? "检查中" : "Checking";
-    if (releaseInfo.status === "error") return lang === "zh" ? "失败" : "Failed";
-    if (releaseInfo.hasUpdate) return lang === "zh" ? "有更新" : "Update found";
-    if (releaseInfo.status === "ok") return lang === "zh" ? "已是最新" : "Up to date";
-    return lang === "zh" ? "未检查" : "Idle";
-  }, [lang, releaseInfo.hasUpdate, releaseInfo.status, updater.state.phase]);
-
   React.useEffect(() => {
     localStorage.setItem(LANG_KEY, lang);
   }, [lang]);
@@ -992,6 +1000,10 @@ function App() {
   React.useEffect(() => {
     localStorage.setItem(PROMPT_INJECTION_MODE_KEY, promptInjectionMode);
   }, [promptInjectionMode]);
+
+  React.useEffect(() => {
+    localStorage.setItem(SESSION_GROUP_BY_CWD_KEY, String(sessionGroupByCwd));
+  }, [sessionGroupByCwd]);
 
   React.useEffect(() => {
     activeConfigDirKeyRef.current = normalizedConfigDirForComparison(configDir);
@@ -1257,18 +1269,20 @@ function App() {
     };
   }), [findLocalProviderForRow, lang, providerCopySourceForRow, providerRows]);
 
+  const sessionMismatchIds = React.useMemo(
+    () => new Set((sessionStatus?.sessions || []).filter((item) => item.needsSync).map((item) => item.id)),
+    [sessionStatus?.sessions],
+  );
   const visibleSessions = React.useMemo(
-    () => (sessionStatus?.sessions || []).filter((item) => showInternalSessions || !item.isSubagent),
-    [sessionStatus?.sessions, showInternalSessions],
+    () => sessionItems.map((item) => sessionMismatchIds.has(item.id) && !item.needsSync
+      ? { ...item, needsSync: true }
+      : item),
+    [sessionItems, sessionMismatchIds],
   );
 
-  const filteredSessions = React.useMemo(() => {
-    const query = deferredSessionQuery.trim().toLowerCase();
-    if (!query) return visibleSessions;
-    return visibleSessions.filter((item) => [item.title, item.cwd, item.rolloutPath, item.modelProvider, item.model, item.id]
-      .filter(Boolean)
-      .some((value) => String(value).toLowerCase().includes(query)));
-  }, [deferredSessionQuery, visibleSessions]);
+  // Search and internal-session filtering happen in SQLite before this page is
+  // returned. Keeping this alias avoids a second client-side full scan.
+  const filteredSessions = visibleSessions;
 
   const allSessionsByCwd = React.useMemo(() => {
     const groups = new Map<string, SessionPreview[]>();
@@ -1297,19 +1311,17 @@ function App() {
   const sessionHasMismatches = Boolean(sessionStatus?.needsSync);
   const sessionTargetLabel = lang === "zh" ? "共享会话" : "Shared history";
   const sessionSyncCount = sessionMismatchCount(sessionStatus);
-  const sessionVisibleTotal = showInternalSessions
-    ? (sessionStatus?.topLevelThreads ?? 0) + (sessionStatus?.subagentThreads ?? 0)
-    : (sessionStatus?.topLevelThreads ?? 0);
-  const sessionPreviewTruncated = sessionVisibleTotal > visibleSessions.length;
+  const sessionVisibleTotal = sessionPageTotal;
+  const sessionPreviewTruncated = sessionHasMore;
   const selectedSessionSet = React.useMemo(() => new Set(selectedSessionIds), [selectedSessionIds]);
   const selectedSessions = React.useMemo(
-    () => (sessionStatus?.sessions || []).filter((item) => selectedSessionSet.has(item.id)),
-    [selectedSessionSet, sessionStatus?.sessions],
+    () => sessionItems.filter((item) => selectedSessionSet.has(item.id)),
+    [selectedSessionSet, sessionItems],
   );
 
   React.useEffect(() => {
-    setSelectedSessionIds((ids) => ids.filter((id) => (sessionStatus?.sessions || []).some((item) => item.id === id)));
-  }, [sessionStatus?.sessions]);
+    setSelectedSessionIds((ids) => ids.filter((id) => sessionItems.some((item) => item.id === id)));
+  }, [sessionItems]);
 
   React.useEffect(() => {
     if (sessionDeleteConfirmOpen && selectedSessions.length === 0) {
@@ -1349,6 +1361,12 @@ function App() {
     setState(null);
     setOfficialProfiles([]);
     setSessionStatus(null);
+    setSessionItems([]);
+    setSessionPageCursor(null);
+    setSessionPageTotal(0);
+    setSessionTopLevelTotal(0);
+    setSessionSubagentTotal(0);
+    setSessionHasMore(false);
     setSkillsMcpState(null);
     setSkillsMcpImportOpen(false);
     setSkillsMcpImportPreview(null);
@@ -1356,6 +1374,7 @@ function App() {
     aboutLoadKeyRef.current = "";
     sessionAutoLoadKeyRef.current = "";
     sessionLoadRequestRef.current += 1;
+    sessionPageRequestRef.current += 1;
 
     if (includeDiagnostics) {
       setStartupDiagnostics(null);
@@ -1433,7 +1452,7 @@ function App() {
     configDir: healthConfigDir,
     canCheck: !refreshing && !loading && !actionBusy
       && !(tab === "provider" && providerMode !== "list") && tab !== "toml",
-    canNotify: !toast && !error && !startupWizardOpen && !updatePromptOpen
+    canNotify: !toast && !error && !startupWizardOpen
       && !loading && !refreshing && !actionBusy
       && !(tab === "provider" && providerMode !== "list") && tab !== "toml",
     lang,
@@ -1529,8 +1548,15 @@ function App() {
     const providersRequestId = ++savedProvidersRequestRef.current;
     setState(result.state);
     setSessionStatus(null);
+    setSessionItems([]);
+    setSessionPageCursor(null);
+    setSessionPageTotal(0);
+    setSessionTopLevelTotal(0);
+    setSessionSubagentTotal(0);
+    setSessionHasMore(false);
     sessionAutoLoadKeyRef.current = "";
     sessionLoadRequestRef.current += 1;
+    sessionPageRequestRef.current += 1;
     setToast(result.message);
     return Promise.allSettled([
       invoke<SavedPrompt[]>("list_saved_prompts"),
@@ -2029,79 +2055,6 @@ function App() {
       });
     }, 0);
   }, [lang]);
-
-  const checkForUpdates = React.useCallback(async ({ quiet = false }: { quiet?: boolean } = {}) => {
-    setReleaseInfo({ status: "checking" });
-    try {
-      if (aboutInfo?.nativeUpdaterSupported !== false) {
-        const updaterResult = await appUpdater.check({ force: !quiet, timeout: 15_000 });
-        if (updaterResult === "available") {
-          const snapshot = appUpdater.getSnapshot();
-          const latestVersion = snapshot.latestVersion || "";
-          const releaseTag = latestVersion.startsWith("v") ? latestVersion : `v${latestVersion}`;
-          setReleaseInfo({
-            status: "ok",
-            latestVersion: releaseTag,
-            htmlUrl: `https://github.com/${FALLBACK_GITHUB_REPO}/releases/tag/${releaseTag}`,
-            hasUpdate: true,
-            updateMethod: "native",
-          });
-          if (quiet) {
-            setToast(lang === "zh" ? `发现新版本 ${releaseTag}，可在概览页查看` : `New version ${releaseTag} is available`);
-          } else {
-            setUpdatePromptOpen(true);
-          }
-          return;
-        }
-
-        if (updaterResult === "up-to-date") {
-          setReleaseInfo({
-            status: "ok",
-            latestVersion: aboutInfo?.appVersion,
-            htmlUrl: `https://github.com/${FALLBACK_GITHUB_REPO}/releases/latest`,
-            hasUpdate: false,
-          });
-          if (!quiet) setToast(lang === "zh" ? "当前已是最新版本" : "You are up to date");
-          return;
-        }
-      }
-
-      // Keep the existing lightweight release check as a manual-download fallback for
-      // bootstrap and portable builds that cannot use the native updater yet.
-      const update = await invoke<AppUpdateInfo>("check_app_update");
-      const message = update.hasUpdate
-        ? (lang === "zh" ? "发现新版本" : "Update available")
-        : (lang === "zh" ? "当前已是最新版本" : "You are up to date");
-      setReleaseInfo({
-        status: "ok",
-        latestVersion: update.latestVersion,
-        htmlUrl: update.htmlUrl,
-        hasUpdate: update.hasUpdate,
-        updateMethod: update.hasUpdate ? "download" : undefined,
-      });
-      if (update.hasUpdate) {
-        if (quiet) {
-          setToast(lang === "zh" ? `发现新版本 ${update.latestVersion}，可在概览页查看` : `New version ${update.latestVersion} is available`);
-        } else {
-          setUpdatePromptOpen(true);
-        }
-      } else if (!quiet) {
-        setToast(message);
-      }
-    } catch {
-      const message = quiet ? (lang === "zh" ? "自动检查失败" : "Auto check failed") : (lang === "zh" ? "检查失败" : "Check failed");
-      setReleaseInfo({
-        status: "error",
-      });
-      if (!quiet) setToast(message);
-    }
-  }, [aboutInfo?.appVersion, aboutInfo?.nativeUpdaterSupported, lang]);
-
-  React.useEffect(() => {
-    if (!state || !aboutInfo || autoUpdateCheckedRef.current) return;
-    autoUpdateCheckedRef.current = true;
-    void checkForUpdates({ quiet: true });
-  }, [aboutInfo, state, checkForUpdates]);
 
   React.useEffect(() => {
     if (!state || tab !== "instruction" || promptAutoRefreshAttemptedRef.current) return;
@@ -2661,6 +2614,64 @@ function App() {
     }
   };
 
+  const requestSessionPage = React.useCallback(async (
+    cursor: SessionPageCursor | null,
+    append: boolean,
+  ) => {
+    const codexDir = state?.codexDir;
+    if (!codexDir || (append && sessionPageLoadingRef.current)) return;
+    const requestId = ++sessionPageRequestRef.current;
+    sessionPageLoadingRef.current = true;
+    setSessionPageLoading(true);
+    try {
+      const page = await invoke<SessionPage>("get_session_page", {
+        configDir: codexDir,
+        cursorUpdatedAtMs: cursor?.updatedAtMs ?? null,
+        cursorId: cursor?.id ?? null,
+        limit: 100,
+        search: deferredSessionQuery.trim() || null,
+        includeInternal: showInternalSessions,
+      });
+      if (requestId !== sessionPageRequestRef.current) return;
+      setSessionItems((current) => {
+        if (!append) return page.sessions;
+        const seen = new Set(current.map((item) => item.id));
+        return [...current, ...page.sessions.filter((item) => !seen.has(item.id))];
+      });
+      setSessionPageCursor(page.nextCursor || null);
+      setSessionPageTotal(page.total);
+      setSessionTopLevelTotal(page.topLevel);
+      setSessionSubagentTotal(page.subagent);
+      setSessionHasMore(page.hasMore);
+    } catch (sessionError) {
+      if (requestId !== sessionPageRequestRef.current) return;
+      if (!append) sessionAutoLoadKeyRef.current = "";
+      setError(String(sessionError));
+    } finally {
+      if (requestId === sessionPageRequestRef.current) {
+        sessionPageLoadingRef.current = false;
+        setSessionPageLoading(false);
+      }
+    }
+  }, [deferredSessionQuery, showInternalSessions, state?.codexDir]);
+
+  const reloadSessionPage = React.useCallback(() => {
+    sessionAutoLoadKeyRef.current = state?.codexDir
+      ? `${state.codexDir}\u0000${deferredSessionQuery.trim()}\u0000${showInternalSessions}`
+      : "";
+    setSelectedSessionIds([]);
+    setSessionDeleteConfirmOpen(false);
+    setSessionItems([]);
+    setSessionPageCursor(null);
+    setSessionHasMore(false);
+    void requestSessionPage(null, false);
+  }, [deferredSessionQuery, requestSessionPage, showInternalSessions, state?.codexDir]);
+
+  const loadMoreSessions = React.useCallback(() => {
+    if (!sessionHasMore || !sessionPageCursor) return;
+    void requestSessionPage(sessionPageCursor, true);
+  }, [requestSessionPage, sessionHasMore, sessionPageCursor]);
+
   const checkSessions = async () => {
     sessionLoadRequestRef.current += 1;
     const actionToken = beginActionBusy("checkSessions");
@@ -2685,27 +2696,19 @@ function App() {
 
   React.useEffect(() => {
     if (tab !== "sessions" || refreshing || !state?.codexDir) return;
-    const loadKey = state.codexDir;
+    const loadKey = `${state.codexDir}\u0000${deferredSessionQuery.trim()}\u0000${showInternalSessions}`;
     if (sessionAutoLoadKeyRef.current === loadKey) return;
-    const requestId = ++sessionLoadRequestRef.current;
-    const actionToken = beginActionBusy("checkSessions");
     sessionAutoLoadKeyRef.current = loadKey;
-    void invoke<SessionSyncStatus>("get_session_sync_status", {
-      configDir: loadKey,
-      targetProvider: null,
-    })
-      .then((status) => {
-        if (requestId === sessionLoadRequestRef.current) setSessionStatus(status);
-      })
-      .catch((sessionError) => {
-        if (requestId !== sessionLoadRequestRef.current) return;
-        sessionAutoLoadKeyRef.current = "";
-        setError(String(sessionError));
-      })
-      .finally(() => {
-        endActionBusy(actionToken);
-      });
-  }, [beginActionBusy, endActionBusy, refreshing, state?.codexDir, tab]);
+    const timer = window.setTimeout(() => {
+      setSelectedSessionIds([]);
+      setSessionDeleteConfirmOpen(false);
+      setSessionItems([]);
+      setSessionPageCursor(null);
+      setSessionHasMore(false);
+      void requestSessionPage(null, false);
+    }, 200);
+    return () => window.clearTimeout(timer);
+  }, [deferredSessionQuery, refreshing, requestSessionPage, showInternalSessions, state?.codexDir, tab]);
 
   const syncSessions = async () => {
     sessionLoadRequestRef.current += 1;
@@ -2715,6 +2718,7 @@ function App() {
       (result) => {
         setSessionStatus(result.status);
         setSelectedSessionIds([]);
+        reloadSessionPage();
         if (!result.status.scanComplete) {
           setToast(result.status.scanFailures[0] || (lang === "zh" ? "无法确认会话同步状态" : "Unable to verify session sync status"));
         } else if (result.status.needsSync) {
@@ -2766,8 +2770,8 @@ function App() {
         },
       });
       setSessionStatus(result.status);
-      const remainingIds = new Set(result.status.sessions.map((item) => item.id));
-      setSelectedSessionIds((ids) => ids.filter((id) => remainingIds.has(id)));
+      setSelectedSessionIds([]);
+      reloadSessionPage();
       setSessionDeleteConfirmOpen(false);
       setSessionDeleteSafetyConfirmed(false);
       const hasPartialFailure = result.failedSessions > 0 || Boolean(result.failureMessage);
@@ -2824,9 +2828,6 @@ function App() {
       codexVersion={aboutInfo?.codexVersion
         || (aboutLoading ? (lang === "zh" ? "正在检测..." : "Detecting...") : undefined)}
       appVersion={aboutInfo?.appVersion}
-      hasUpdate={Boolean(releaseInfo.hasUpdate)}
-      updatePhase={updater.state.phase}
-      onOpenUpdate={() => setUpdatePromptOpen(true)}
       isMacRuntime={isMacRuntime}
       contentClassName={cx(
         tab === "sessions" && "cx-app-content--sessions",
@@ -2858,21 +2859,6 @@ function App() {
           openConfigurationChecks();
         }}
       />}
-      <UpdateDialog
-        open={updatePromptOpen && Boolean(releaseInfo.hasUpdate)}
-        lang={lang}
-        state={releaseInfo.updateMethod === "native" ? updater.state : undefined}
-        currentVersion={aboutInfo?.appVersion}
-        latestVersion={releaseInfo.latestVersion}
-        onClose={() => setUpdatePromptOpen(false)}
-        onUpdate={releaseInfo.updateMethod === "native" ? updater.downloadAndInstall : undefined}
-        onRetry={releaseInfo.updateMethod === "native" ? updater.retry : undefined}
-        onRestart={releaseInfo.updateMethod === "native" ? updater.restart : undefined}
-        onDownload={() => {
-          setUpdatePromptOpen(false);
-          openExternalUrl(releaseInfo.htmlUrl);
-        }}
-      />
       <StartupWizardDialog
         open={startupWizardOpen}
         mode={startupCheckMode}
@@ -2929,11 +2915,8 @@ function App() {
                     : state.instructionFile)
                   : null}
                 loading={loading || refreshing}
-                hasUpdate={Boolean(releaseInfo.status === "ok" && releaseInfo.hasUpdate)}
-                latestVersion={releaseInfo.latestVersion}
                 onConfigDirChange={setConfigDirDraft}
                 onRefresh={() => refresh(false)}
-                onOpenUpdate={() => setUpdatePromptOpen(true)}
               />
             )}
 
@@ -3082,12 +3065,17 @@ function App() {
               <SessionManagementPage
                 active={tab === "sessions"}
                 lang={lang}
+                codexDir={state.codexDir}
                 sessionStatus={sessionStatus}
                 sessionHasMismatches={sessionHasMismatches}
                 sessionSyncCount={sessionSyncCount}
                 sessionTargetLabel={sessionTargetLabel}
                 sessionVisibleTotal={sessionVisibleTotal}
+                sessionTopLevelTotal={sessionTopLevelTotal}
+                sessionInternalTotal={sessionSubagentTotal}
                 sessionPreviewTruncated={sessionPreviewTruncated}
+                sessionHasMore={sessionHasMore}
+                sessionLoadingMore={sessionPageLoading}
                 visibleSessions={visibleSessions}
                 filteredSessions={filteredSessions}
                 allSessionsByCwd={allSessionsByCwd}
@@ -3107,6 +3095,7 @@ function App() {
                 onExportSessions={exportSessions}
                 onCheckSessions={checkSessions}
                 onSyncSessions={syncSessions}
+                onLoadMore={loadMoreSessions}
                 onSessionQueryChange={(value) => {
                   setSessionQuery(value);
                   setSelectedSessionIds([]);
@@ -3243,19 +3232,13 @@ function App() {
               <AboutPage
                 copy={{
                   eyebrow: "About",
-                  title: lang === "zh" ? "关于 Codex-X" : "About Codex-X",
-                  appVersionLabel: `Codex-X ${lang === "zh" ? "版本" : "Version"}`,
+                  title: lang === "zh" ? "关于 Codex-X Fork" : "About Codex-X Fork",
+                  appVersionLabel: `Codex-X Fork ${lang === "zh" ? "版本" : "Version"}`,
                   codexVersionLabel: `Codex CLI ${lang === "zh" ? "版本" : "Version"}`,
                   codexHomeLabel: "CODEX_HOME",
                   projectLabel: lang === "zh" ? "项目地址" : "Project",
                   openProjectLabel: lang === "zh" ? "打开项目主页" : "Open project",
                   openIssuesLabel: lang === "zh" ? "反馈问题" : "Issues",
-                  releasesEyebrow: "GitHub Releases",
-                  releasesTitle: lang === "zh" ? "更新检查" : "Update check",
-                  releaseStatusLabel: lang === "zh" ? "状态" : "Status",
-                  latestVersionLabel: lang === "zh" ? "最新版本" : "Latest version",
-                  checkUpdateLabel: lang === "zh" ? "检查更新" : "Check updates",
-                  openReleasesLabel: lang === "zh" ? "打开下载页" : "Open releases",
                 }}
                 appVersion={aboutInfo?.appVersion || (aboutLoading ? (lang === "zh" ? "正在检测" : "Detecting") : "-")}
                 codexVersion={aboutInfo?.codexVersion || (aboutLoading
@@ -3263,25 +3246,8 @@ function App() {
                   : (lang === "zh" ? "未检测到" : "Not detected"))}
                 codexHome={aboutInfo?.codexDir || state?.codexDir || configDir || "~/.codex"}
                 projectUrl={aboutInfo?.projectUrl || `https://github.com/${FALLBACK_GITHUB_REPO}`}
-                release={{
-                  status: releaseStatusLabel,
-                  latestVersion: releaseInfo.latestVersion || "-",
-                  tone: releaseInfo.status === "error"
-                    ? "error"
-                    : releaseInfo.hasUpdate
-                      ? "warning"
-                      : releaseInfo.status === "ok"
-                        ? "success"
-                        : "neutral",
-                  checking: releaseInfo.status === "checking"
-                    || updater.state.phase === "downloading"
-                    || updater.state.phase === "installing",
-                  canOpenReleases: Boolean(releaseInfo.htmlUrl),
-                }}
                 onOpenProject={() => openExternalUrl(aboutInfo?.projectUrl || `https://github.com/${FALLBACK_GITHUB_REPO}`)}
                 onOpenIssues={() => openExternalUrl(`${aboutInfo?.projectUrl || `https://github.com/${FALLBACK_GITHUB_REPO}`}/issues`)}
-                onCheckUpdate={() => void checkForUpdates()}
-                onOpenReleases={() => openExternalUrl(releaseInfo.htmlUrl)}
               />
             )}
 
@@ -3306,7 +3272,7 @@ function App() {
                   englishLabel: t.settings.en,
                   productTitle: t.settings.productName,
                   productDescription: t.settings.productDesc,
-                  productValue: "Codex-X",
+                  productValue: "Codex-X Fork · codex-x-fork",
                   recheckTitle: lang === "zh" ? "环境与配置检查" : "Environment & configuration check",
                   recheckDescription: lang === "zh"
                     ? "查看 Codex 环境与配置状态，按需检查和修复。"

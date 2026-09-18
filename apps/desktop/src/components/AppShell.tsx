@@ -2,14 +2,11 @@ import React from "react";
 import type { ReactNode } from "react";
 import {
   Blocks,
-  Download,
   FileCode2,
   History,
   Info,
   LayoutDashboard,
-  LoaderCircle,
   Moon,
-  RotateCcw,
   Settings,
   Sparkles,
   Sun,
@@ -17,8 +14,6 @@ import {
   Zap,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import type { AppUpdaterPhase } from "../appUpdater";
-import { IconButton } from "./ui/IconButton";
 
 export type AppLanguage = "zh" | "en";
 export type AppTheme = "light" | "dark";
@@ -58,9 +53,6 @@ export type AppShellProps = {
   onToggleTheme: () => void;
   codexVersion?: string | null;
   appVersion?: string | null;
-  hasUpdate?: boolean;
-  updatePhase?: AppUpdaterPhase;
-  onOpenUpdate?: () => void;
   isMacRuntime?: boolean;
   children: ReactNode;
   sidebarFooter?: ReactNode;
@@ -76,9 +68,6 @@ export function AppShell({
   onToggleTheme,
   codexVersion,
   appVersion,
-  hasUpdate = false,
-  updatePhase = "idle",
-  onOpenUpdate,
   isMacRuntime = false,
   children,
   sidebarFooter,
@@ -102,27 +91,6 @@ export function AppShell({
     ? (lang === "zh" ? "切换为浅色模式" : "Switch to light mode")
     : (lang === "zh" ? "切换为深色模式" : "Switch to dark mode");
   const ThemeIcon = theme === "dark" ? Moon : Sun;
-  const updateActionState = updatePhase === "downloading"
-    || updatePhase === "installing"
-    || updatePhase === "ready"
-    || updatePhase === "available"
-    ? updatePhase
-    : hasUpdate
-      ? "available"
-      : null;
-  const updateActionLabel = updateActionState === "downloading"
-    ? (lang === "zh" ? "查看更新下载进度" : "View update download progress")
-    : updateActionState === "installing"
-      ? (lang === "zh" ? "查看更新安装进度" : "View update installation progress")
-      : updateActionState === "ready"
-        ? (lang === "zh" ? "打开更新窗口并重新启动" : "Open update window and restart")
-        : (lang === "zh" ? "查看并下载更新" : "View and download update");
-  const UpdateActionIcon = updateActionState === "downloading" || updateActionState === "installing"
-    ? LoaderCircle
-    : updateActionState === "ready"
-      ? RotateCcw
-      : Download;
-
   return (
     <div className={shellClassName}>
       {isMacRuntime && (
@@ -135,23 +103,11 @@ export function AppShell({
           <div className="cx-brand-copy">
             <div className="cx-brand-title-row">
               <h1>Codex-X</h1>
+              <span className="cx-fork-badge">codex-x-fork</span>
               {appVersion && <span className="cx-app-version">v{appVersion.replace(/^v/i, "")}</span>}
             </div>
             <p>{lang === "zh" ? "切换 · 指令 · 配置" : "Switch · Instruct · Config"}</p>
           </div>
-          {updateActionState && onOpenUpdate && (
-            <IconButton
-              className="cx-brand-update"
-              variant="ghost"
-              size="md"
-              icon={<UpdateActionIcon aria-hidden="true" />}
-              label={updateActionLabel}
-              title={updateActionLabel}
-              onClick={onOpenUpdate}
-              aria-busy={updateActionState === "downloading" || updateActionState === "installing"}
-              data-update-state={updateActionState}
-            />
-          )}
         </div>
 
         <nav className="cx-sidebar-nav" aria-label={navigationLabel}>

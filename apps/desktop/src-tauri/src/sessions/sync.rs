@@ -194,12 +194,23 @@ pub(super) fn session_sync_status_with_discovery(
     discovery: &SqliteDiscovery,
 ) -> Result<SessionSyncStatus> {
     let scan = scan_provider_sync_data(codex_dir, &target, discovery)?;
+    session_sync_status_from_scan(codex_dir, target, discovery, scan)
+}
+
+fn session_sync_status_from_scan(
+    codex_dir: &Path,
+    target: String,
+    discovery: &SqliteDiscovery,
+    scan: ProviderSyncScan,
+) -> Result<SessionSyncStatus> {
     let display_sqlite = if scan.active_sqlite.sqlite_dbs > 0 {
         &scan.active_sqlite
     } else {
         &scan.sqlite
     };
-    let session_limit = display_sqlite.sqlite_threads.clamp(50, 1000);
+    // Status diagnostics stay bounded; the visible list is served separately by
+    // get_session_page and never piggybacks a large payload onto a scan result.
+    let session_limit = 100;
     let preview_paths = if discovery.active_paths.is_empty() {
         discovery.active_first_session_paths()
     } else {
@@ -339,11 +350,6 @@ where
     let _maintenance_lock = acquire_session_maintenance_lock(&codex_dir)?;
     let discovery = discover_sqlite_databases(&codex_dir);
     ensure_sqlite_discovery_writable(&discovery)?;
-    let initial_status =
-        session_sync_status_with_discovery(&codex_dir, target_provider.clone(), &discovery)?;
-    if !initial_status.scan_complete {
-        return Err(scan_failure_error(&initial_status.scan_failures));
-    }
     let preflight_scan = scan_provider_sync_data(&codex_dir, &target_provider, &discovery)?;
     if !preflight_scan.scan_failures.is_empty() {
         return Err(scan_failure_error(&preflight_scan.scan_failures));
@@ -352,8 +358,10 @@ where
         && preflight_scan.sqlite.mismatched_threads == 0
         && preflight_scan.catalog.total_updates() == 0
     {
+        let status =
+            session_sync_status_from_scan(&codex_dir, target_provider, &discovery, preflight_scan)?;
         return Ok(SessionSyncResult {
-            status: initial_status,
+            status,
             updated_rollouts: 0,
             updated_threads: 0,
             backup_dir: String::new(),
@@ -378,7 +386,7 @@ where
         && scan.catalog.total_updates() == 0
     {
         rollback_open_transactions(&mut pending_sqlite);
-        let status = session_sync_status_with_discovery(&codex_dir, target_provider, &discovery)?;
+        let status = session_sync_status_from_scan(&codex_dir, target_provider, &discovery, scan)?;
         return Ok(SessionSyncResult {
             status,
             updated_rollouts: 0,

@@ -1,5 +1,4 @@
 import {
-  ArrowUpRight,
   CheckCircle2,
   CircleAlert,
   Code2,
@@ -29,11 +28,8 @@ export type OverviewPageProps = {
   modelProvider?: string | null;
   instructionPath?: string | null;
   loading: boolean;
-  hasUpdate: boolean;
-  latestVersion?: string | null;
   onConfigDirChange: (value: string) => void;
   onRefresh: () => void;
-  onOpenUpdate: () => void;
 };
 
 type StatusCardProps = {
@@ -86,11 +82,8 @@ export function OverviewPage({
   modelProvider,
   instructionPath,
   loading,
-  hasUpdate,
-  latestVersion,
   onConfigDirChange,
   onRefresh,
-  onOpenUpdate,
 }: OverviewPageProps) {
   const isChinese = lang === "zh";
   const text = isChinese
@@ -113,9 +106,6 @@ export function OverviewPage({
         authFile: "auth.json 已找到",
         officialAuth: "官方认证已保存",
         noAuth: "未找到",
-        updateFound: "发现新版本",
-        updateAvailable: (version: string) => `Codex-X ${version} 已发布`,
-        viewUpdate: "查看更新",
         liveStatus: "实时状态",
         currentConfig: "当前 Codex 配置",
         on: "提示词已启用",
@@ -147,9 +137,6 @@ export function OverviewPage({
         authFile: "auth.json found",
         officialAuth: "Official auth saved",
         noAuth: "Not found",
-        updateFound: "New version available",
-        updateAvailable: (version: string) => `Codex-X ${version} is available`,
-        viewUpdate: "View update",
         liveStatus: "LIVE STATUS",
         currentConfig: "Current Codex configuration",
         on: "Instructions enabled",
@@ -174,7 +161,6 @@ export function OverviewPage({
     : (configDir.trim() || unresolvedStatus);
   const displayConfigPath = ready ? (configPath?.trim() || text.notConfigured) : unresolvedStatus;
   const displayInstructionPath = ready ? (instructionPath?.trim() || text.notConfigured) : unresolvedStatus;
-  const updateVersion = latestVersion?.trim() || "";
   const homeInputValue = configDir;
   const authAvailable = ready && (authExists || officialAuthAvailable);
   const authStatus = ready
@@ -212,22 +198,6 @@ export function OverviewPage({
           </button>
         </div>
       </header>
-
-      {hasUpdate && (
-        <aside className="cx-overview-update-strip" role="status">
-          <div className="cx-overview-update-copy">
-            <span className="cx-overview-update-dot" aria-hidden="true" />
-            <div>
-              <strong>{text.updateFound}</strong>
-              {updateVersion && <p>{text.updateAvailable(updateVersion)}</p>}
-            </div>
-          </div>
-          <button type="button" onClick={onOpenUpdate}>
-            {text.viewUpdate}
-            <ArrowUpRight size={15} strokeWidth={2} aria-hidden="true" />
-          </button>
-        </aside>
-      )}
 
       <div className="cx-overview-status-grid">
         <StatusCard
